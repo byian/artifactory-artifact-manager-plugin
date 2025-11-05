@@ -12,7 +12,6 @@ import java.util.List;
 import java.util.stream.Collectors;
 import org.jfrog.artifactory.client.*;
 import org.jfrog.artifactory.client.model.*;
-import org.jfrog.filespecs.FileSpec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -105,9 +104,10 @@ class ArtifactoryClient implements AutoCloseable {
     }
 
     /**
-     * List the files in a folder
+     * List the immediate children in a folder (non-recursive)
+     * Uses Artifactory Storage API which is more efficient than AQL searches
      * @param targetPath the path to list
-     * @return the list of files in the folder
+     * @return the list of immediate children in the folder
      * @throws IOException if the files cannot be listed
      */
     public List<FileInfo> list(String targetPath) throws IOException {
@@ -115,15 +115,31 @@ class ArtifactoryClient implements AutoCloseable {
             LOGGER.debug(String.format("Target path %s is not a folder. Cannot list files", targetPath));
             return List.of();
         }
-        FileSpec fileSpec = FileSpec.fromString(
-                String.format("{\"files\": [{\"pattern\": \"%s/%s*\"}]}", this.config.repository, targetPath));
-        return artifactory.searches().artifactsByFileSpec(fileSpec).stream()
-                .map((item -> new FileInfo(
-                        String.format("%s/%s", item.getPath(), item.getName()),
-                        item.getModified().getTime(),
-                        item.getSize(),
-                        item.getType())))
-                .collect(Collectors.toList());
+
+        try {
+            // Use Storage API to get folder info with immediate children only
+            // This is much more efficient than FileSpec/AQL searches which fetch all nested files
+            Folder folder = artifactory.repository(this.config.repository)
+                    .folder(Utils.urlEncodeParts(targetPath));
+
+            return folder.list().stream()
+                    .map(item -> {
+                        // Construct full path for the child item
+                        String childPath = targetPath.endsWith("/")
+                                ? targetPath + item.getUri().substring(1)  // Remove leading "/" from URI
+                                : targetPath + item.getUri();
+
+                        return new FileInfo(
+                                childPath,
+                                item.getLastModified().getTime(),
+                                item.getSize(),
+                                item.isFolder() ? AqlItemType.FOLDER : AqlItemType.FILE);
+                    })
+                    .collect(Collectors.toList());
+        } catch (Exception e) {
+            LOGGER.warn(String.format("Failed to list folder contents for %s", targetPath), e);
+            return List.of();
+        }
     }
 
     /**

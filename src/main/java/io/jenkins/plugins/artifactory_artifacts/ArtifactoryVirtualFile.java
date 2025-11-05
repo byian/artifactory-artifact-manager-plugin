@@ -10,13 +10,9 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Objects;
-import java.util.Set;
 import java.util.stream.Collectors;
 import jenkins.util.VirtualFile;
-import org.jfrog.artifactory.client.model.AqlItemType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -192,64 +188,19 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         return new ArtifactoryClient(config.getServerUrl(), config.getRepository(), Utils.getCredentials());
     }
 
-    private String normalizePath(String path) {
-        // Remove double slashes
-        String normalized = path.replaceAll("//+", "/");
-
-        // Remove leading slash
-        if (normalized.startsWith("/")) {
-            normalized = normalized.substring(1);
-        }
-
-        return normalized;
-    }
-
     /**
-     * List the files from a prefix
-     * @param prefix the prefix
-     * @return the list of files from the prefix
+     * List the immediate children from a prefix
+     * @param prefix the prefix (folder path)
+     * @return the list of immediate children (files and folders)
      */
     private List<VirtualFile> listFilesFromPrefix(String prefix) {
         try (ArtifactoryClient client = buildArtifactoryClient()) {
-            List<ArtifactoryClient.FileInfo> files = client.list(prefix);
+            // client.list() now returns only immediate children, not all nested files
+            // This eliminates the need for complex path parsing and deduplication
+            List<ArtifactoryClient.FileInfo> children = client.list(prefix);
 
-            Set<String> seen = new HashSet<>();
-            String normalizedPrefix = normalizePath(prefix);
-
-            return files.stream()
-                    .map(fileInfo -> {
-                        String normalizedPath = normalizePath(fileInfo.getPath());
-
-                        // Calculate relative path correctly
-                        String relativePath = normalizedPath.startsWith(normalizedPrefix)
-                                ? normalizedPath.substring(normalizedPrefix.length())
-                                : normalizedPath;
-
-                        // Get just the first filename/foldername, not the full path
-                        int slashIndex = relativePath.indexOf('/');
-                        String immediateName =
-                                (slashIndex == -1) ? relativePath : relativePath.substring(0, slashIndex);
-
-                        // Check uniqueness
-                        if (!seen.add(immediateName)) {
-                            return null;
-                        }
-
-                        boolean isFolder = (slashIndex != -1);
-
-                        if (isFolder) {
-                            String folderPath = normalizedPrefix + immediateName;
-                            ArtifactoryClient.FileInfo folderInfo = new ArtifactoryClient.FileInfo(
-                                    folderPath,
-                                    fileInfo.getLastUpdated(),
-                                    0, // folder size 0
-                                    AqlItemType.FOLDER);
-                            return new ArtifactoryVirtualFile(folderInfo, this.build);
-                        } else {
-                            return new ArtifactoryVirtualFile(fileInfo, this.build);
-                        }
-                    })
-                    .filter(Objects::nonNull)
+            return children.stream()
+                    .map(fileInfo -> new ArtifactoryVirtualFile(fileInfo, this.build))
                     .collect(Collectors.toList());
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to list files from prefix %s", prefix), e);
