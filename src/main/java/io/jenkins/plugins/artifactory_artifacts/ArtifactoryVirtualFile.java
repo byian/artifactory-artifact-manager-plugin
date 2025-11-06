@@ -6,11 +6,12 @@ import hudson.model.Run;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.Serializable;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
-import java.util.Collections;
-import java.util.List;
+import java.util.*;
+import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
 import jenkins.util.VirtualFile;
 import org.slf4j.Logger;
@@ -20,6 +21,13 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
 
     private static final long serialVersionUID = 1L;
     private static final Logger LOGGER = LoggerFactory.getLogger(ArtifactoryVirtualFile.class);
+
+    /**
+     * ThreadLocal cache for storing metadata to avoid excessive API calls.
+     * Pattern follows S3 and Azure artifact manager plugins.
+     * Keyed by repository name, values are stacks of cache frames for nested calls.
+     */
+    private static final ThreadLocal<Map<String, Deque<CacheFrame>>> cache = new ThreadLocal<>();
 
     @SuppressWarnings("lgtm[jenkins/plaintext-storage]")
     private final String key;
@@ -87,6 +95,31 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (keyWithNoSlash.endsWith("/*view*")) {
             return false;
         }
+        // Check cache first
+        String repository = Utils.getArtifactConfig().getRepository();
+        Map<String, Deque<CacheFrame>> m = cache.get();
+        if (m != null) {
+            Deque<CacheFrame> stack = m.get(repository);
+            if (stack != null && !stack.isEmpty()) {
+                for (CacheFrame frame : stack) {
+                    if (key.startsWith(frame.root)) {
+                        String relativePath = key.substring(frame.root.length());
+                        // Check if this path is in cache
+                        if (frame.files.containsKey(relativePath)) {
+                            return false; // It's a file if it's directly in cache
+                        }
+                        // Check if any cached path starts with this path + "/"
+                        String dirPrefix = relativePath.isEmpty() ? "" : relativePath + "/";
+                        for (String cachedPath : frame.files.keySet()) {
+                            if (cachedPath.startsWith(dirPrefix)) {
+                                return true; // It's a directory if we have files under it
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Fall back to API call
         try (ArtifactoryClient client = buildArtifactoryClient()) {
             return client.isFolder(this.key);
         } catch (Exception e) {
@@ -104,6 +137,12 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (keyS.endsWith("/*view*/")) {
             return false;
         }
+        // Check cache first
+        CachedMetadata metadata = getCachedMetadata();
+        if (metadata != null) {
+            return true; // If it's in cache with metadata, it's a file
+        }
+        // Fall back to API call
         try (ArtifactoryClient client = buildArtifactoryClient()) {
             return client.isFile(this.key);
         } catch (Exception e) {
@@ -121,6 +160,41 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
     @Override
     public VirtualFile[] list() throws IOException {
         String prefix = Utils.stripTrailingSlash(this.key) + "/";
+
+        // Check cache first
+        String repository = Utils.getArtifactConfig().getRepository();
+        Map<String, Deque<CacheFrame>> m = cache.get();
+        if (m != null) {
+            Deque<CacheFrame> stack = m.get(repository);
+            if (stack != null && !stack.isEmpty()) {
+                for (CacheFrame frame : stack) {
+                    if (prefix.startsWith(frame.root)) {
+                        // List immediate children from cache
+                        String relativePrefix = prefix.substring(frame.root.length());
+                        Set<String> immediateChildren = new HashSet<>();
+
+                        for (String relativePath : frame.files.keySet()) {
+                            if (relativePath.startsWith(relativePrefix)) {
+                                String remainder = relativePath.substring(relativePrefix.length());
+                                // Get the immediate child name (before next slash)
+                                int slashIndex = remainder.indexOf('/');
+                                String immediateName = slashIndex == -1 ? remainder : remainder.substring(0, slashIndex);
+                                if (!immediateName.isEmpty()) {
+                                    immediateChildren.add(immediateName);
+                                }
+                            }
+                        }
+
+                        // Create VirtualFile objects for immediate children
+                        return immediateChildren.stream()
+                                .map(name -> new ArtifactoryVirtualFile(prefix + name, build))
+                                .toArray(VirtualFile[]::new);
+                    }
+                }
+            }
+        }
+
+        // Fall back to API call
         List<VirtualFile> files = listFilesFromPrefix(prefix);
         if (files.isEmpty()) {
             return new VirtualFile[0];
@@ -140,6 +214,12 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (this.fileInfo != null) {
             return this.fileInfo.getSize();
         }
+        // Check cache first
+        CachedMetadata metadata = getCachedMetadata();
+        if (metadata != null) {
+            return metadata.length;
+        }
+        // Fall back to API call
         try (ArtifactoryClient client = buildArtifactoryClient()) {
             return client.size(this.key);
         } catch (Exception e) {
@@ -153,6 +233,12 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (this.fileInfo != null) {
             return this.fileInfo.getLastUpdated();
         }
+        // Check cache first
+        CachedMetadata metadata = getCachedMetadata();
+        if (metadata != null) {
+            return metadata.lastModified;
+        }
+        // Fall back to API call
         try (ArtifactoryClient client = buildArtifactoryClient()) {
             return client.lastUpdated(this.key);
         } catch (Exception e) {
@@ -205,6 +291,151 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to list files from prefix %s", prefix), e);
             return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Runs a computation with a cache populated for artifact metadata.
+     * Performs a single recursive listing to populate the cache, then serves
+     * all subsequent operations from cache to avoid excessive API calls.
+     *
+     * Pattern follows S3 and Azure artifact manager plugins.
+     *
+     * @param <V> the return type
+     * @param callable the computation to run with cache
+     * @return the result of the computation
+     * @throws IOException if an error occurs
+     */
+    public <V> V run(Callable<V> callable) throws IOException {
+        String repository = Utils.getArtifactConfig().getRepository();
+
+        Map<String, Deque<CacheFrame>> m = cache.get();
+        if (m == null) {
+            m = new HashMap<>();
+            cache.set(m);
+        }
+
+        Deque<CacheFrame> stack = m.computeIfAbsent(repository, k -> new ArrayDeque<>());
+
+        // Populate cache frame with recursive listing
+        Map<String, CachedMetadata> files = new HashMap<>();
+        String root = Utils.stripTrailingSlash(this.key) + "/";
+
+        try (ArtifactoryClient client = buildArtifactoryClient()) {
+            // Recursively list all files under this root to populate cache
+            populateCache(client, root, root, files);
+        } catch (Exception e) {
+            LOGGER.warn(String.format("Failed to populate cache for %s", root), e);
+        }
+
+        CacheFrame frame = new CacheFrame(root, files);
+        stack.push(frame);
+
+        try {
+            return callable.call();
+        } catch (IOException | RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException(e);
+        } finally {
+            stack.pop();
+            if (stack.isEmpty()) {
+                m.remove(repository);
+                if (m.isEmpty()) {
+                    cache.remove();
+                }
+            }
+        }
+    }
+
+    /**
+     * Recursively populate cache with all files under the given prefix.
+     * All paths are stored relative to the original root, not the current prefix.
+     *
+     * @param client the Artifactory client
+     * @param root the original root path (remains constant across recursive calls)
+     * @param currentPrefix the current prefix being listed
+     * @param files the map to populate with relative paths to metadata
+     */
+    private void populateCache(
+            ArtifactoryClient client, String root, String currentPrefix, Map<String, CachedMetadata> files)
+            throws IOException {
+        List<ArtifactoryClient.FileInfo> children = client.list(currentPrefix);
+
+        for (ArtifactoryClient.FileInfo child : children) {
+            // Calculate path relative to original root, not current prefix
+            String relativePath = child.getPath().substring(root.length());
+            files.put(relativePath, new CachedMetadata(child.getSize(), child.getLastUpdated()));
+
+            // Recursively list subdirectories
+            if (child.isDirectory()) {
+                String childPrefix = child.getPath();
+                if (!childPrefix.endsWith("/")) {
+                    childPrefix += "/";
+                }
+                populateCache(client, root, childPrefix, files);
+            }
+        }
+    }
+
+    /**
+     * Gets cached metadata for a relative path
+     */
+    private CachedMetadata getCachedMetadata() {
+        String repository = Utils.getArtifactConfig().getRepository();
+        Map<String, Deque<CacheFrame>> m = cache.get();
+        if (m == null) {
+            return null;
+        }
+
+        Deque<CacheFrame> stack = m.get(repository);
+        if (stack == null || stack.isEmpty()) {
+            return null;
+        }
+
+        for (CacheFrame frame : stack) {
+            if (key.startsWith(frame.root)) {
+                String relativePath = key.substring(frame.root.length());
+                CachedMetadata metadata = frame.files.get(relativePath);
+                if (metadata != null) {
+                    return metadata;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Cached metadata for a file
+     */
+    private static final class CachedMetadata implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        final long length;
+        final long lastModified;
+
+        CachedMetadata(long length, long lastModified) {
+            this.length = length;
+            this.lastModified = lastModified;
+        }
+    }
+
+    /**
+     * A cache frame representing metadata for files under a root directory
+     */
+    private static final class CacheFrame implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        /** Root directory path with trailing slash */
+        final String root;
+
+        /** Map of relative paths to cached metadata */
+        final Map<String, CachedMetadata> files;
+
+        CacheFrame(String root, Map<String, CachedMetadata> files) {
+            this.root = root;
+            this.files = files;
         }
     }
 }
