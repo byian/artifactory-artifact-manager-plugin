@@ -27,6 +27,10 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
     private final transient Run<?, ?> build;
     private final ArtifactoryClient.FileInfo fileInfo;
 
+    // Transient cached client - reused across operations to avoid creating/destroying connections
+    // Similar to how S3 plugin caches BlobStoreContext
+    private transient ArtifactoryClient cachedClient;
+
     public ArtifactoryVirtualFile(String key, Run<?, ?> build) {
         this.key = key;
         this.build = build;
@@ -87,8 +91,8 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (keyWithNoSlash.endsWith("/*view*")) {
             return false;
         }
-        try (ArtifactoryClient client = buildArtifactoryClient()) {
-            return client.isFolder(this.key);
+        try {
+            return buildArtifactoryClient().isFolder(this.key);
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to check if %s is a directory", this.key), e);
             return false;
@@ -104,8 +108,8 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (keyS.endsWith("/*view*/")) {
             return false;
         }
-        try (ArtifactoryClient client = buildArtifactoryClient()) {
-            return client.isFile(this.key);
+        try {
+            return buildArtifactoryClient().isFile(this.key);
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to check if %s is a file", this.key), e);
             return false;
@@ -140,8 +144,8 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (this.fileInfo != null) {
             return this.fileInfo.getSize();
         }
-        try (ArtifactoryClient client = buildArtifactoryClient()) {
-            return client.size(this.key);
+        try {
+            return buildArtifactoryClient().size(this.key);
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to get size of %s", this.key), e);
             return 0;
@@ -153,8 +157,8 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (this.fileInfo != null) {
             return this.fileInfo.getLastUpdated();
         }
-        try (ArtifactoryClient client = buildArtifactoryClient()) {
-            return client.lastUpdated(this.key);
+        try {
+            return buildArtifactoryClient().lastUpdated(this.key);
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to get last updated time of %s", this.key), e);
             return 0;
@@ -175,7 +179,8 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (!isFile()) {
             throw new FileNotFoundException("Cannot open it because it is not a file.");
         }
-        try (ArtifactoryClient client = buildArtifactoryClient()) {
+        ArtifactoryClient client = buildArtifactoryClient();
+        try {
             return client.downloadArtifact(this.key);
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to open %s", this.key), e);
@@ -184,8 +189,11 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
     }
 
     private ArtifactoryClient buildArtifactoryClient() {
-        ArtifactoryGenericArtifactConfig config = Utils.getArtifactConfig();
-        return new ArtifactoryClient(config.getServerUrl(), config.getRepository(), Utils.getCredentials());
+        if (cachedClient == null) {
+            ArtifactoryGenericArtifactConfig config = Utils.getArtifactConfig();
+            cachedClient = new ArtifactoryClient(config.getServerUrl(), config.getRepository(), Utils.getCredentials());
+        }
+        return cachedClient;
     }
 
     /**
@@ -194,10 +202,10 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
      * @return the list of immediate children (files and folders)
      */
     private List<VirtualFile> listFilesFromPrefix(String prefix) {
-        try (ArtifactoryClient client = buildArtifactoryClient()) {
+        try {
             // client.list() now returns only immediate children, not all nested files
             // This eliminates the need for complex path parsing and deduplication
-            List<ArtifactoryClient.FileInfo> children = client.list(prefix);
+            List<ArtifactoryClient.FileInfo> children = buildArtifactoryClient().list(prefix);
 
             return children.stream()
                     .map(fileInfo -> new ArtifactoryVirtualFile(fileInfo, this.build))

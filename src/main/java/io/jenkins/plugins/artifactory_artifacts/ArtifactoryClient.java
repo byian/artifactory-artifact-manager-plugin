@@ -123,36 +123,51 @@ class ArtifactoryClient implements AutoCloseable {
                     artifactory.repository(this.config.repository).folder(Utils.urlEncodeParts(targetPath));
             Folder folder = folderHandle.info();
 
-            return folder.getChildren().stream()
+            List<Item> children = folder.getChildren();
+            LOGGER.debug(String.format("Found %d children in %s", children.size(), targetPath));
+
+            return children.stream()
                     .map(item -> {
-                        // Construct full path for the child item
-                        String childPath = targetPath.endsWith("/")
-                                ? targetPath + item.getUri().substring(1) // Remove leading "/" from URI
-                                : targetPath + item.getUri();
+                        try {
+                            // Construct full path for the child item
+                            String childPath = targetPath.endsWith("/")
+                                    ? targetPath + item.getUri().substring(1) // Remove leading "/" from URI
+                                    : targetPath + item.getUri();
 
-                        // Get file size - children from getChildren() don't include size, need to fetch it
-                        long size = 0;
-                        if (!item.isFolder()) {
-                            try {
-                                // Make an additional API call to get file info with size
-                                File fileInfo = artifactory
-                                        .repository(this.config.repository)
-                                        .file(Utils.urlEncodeParts(childPath))
-                                        .info();
-                                size = fileInfo.getSize();
-                            } catch (Exception e) {
-                                LOGGER.debug(String.format("Failed to get size for %s", childPath), e);
+                            LOGGER.debug(String.format("Processing child: %s (folder=%s)", childPath, item.isFolder()));
+
+                            // Get file size - children from getChildren() don't include size, need to fetch it
+                            long size = 0;
+                            if (!item.isFolder()) {
+                                try {
+                                    // Make an additional API call to get file info with size
+                                    File fileInfo = artifactory
+                                            .repository(this.config.repository)
+                                            .file(Utils.urlEncodeParts(childPath))
+                                            .info();
+                                    size = fileInfo.getSize();
+                                    LOGGER.debug(String.format("File %s size: %d bytes", childPath, size));
+                                } catch (Exception e) {
+                                    LOGGER.warn(String.format("Failed to get size for %s", childPath), e);
+                                }
                             }
+
+                            // Get last modified time, defaulting to 0 if null
+                            long lastModified = item.getLastModified() != null
+                                    ? item.getLastModified().getTime()
+                                    : 0;
+
+                            return new FileInfo(
+                                    childPath,
+                                    lastModified,
+                                    size,
+                                    item.isFolder() ? AqlItemType.FOLDER : AqlItemType.FILE);
+                        } catch (Exception e) {
+                            LOGGER.error(String.format("Error processing item in %s", targetPath), e);
+                            return null; // Return null for failed items
                         }
-
-                        // Get last modified time, defaulting to 0 if null
-                        long lastModified = item.getLastModified() != null
-                                ? item.getLastModified().getTime()
-                                : 0;
-
-                        return new FileInfo(
-                                childPath, lastModified, size, item.isFolder() ? AqlItemType.FOLDER : AqlItemType.FILE);
                     })
+                    .filter(fileInfo -> fileInfo != null) // Filter out failed items
                     .collect(Collectors.toList());
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to list folder contents for %s", targetPath), e);
@@ -192,7 +207,7 @@ class ArtifactoryClient implements AutoCloseable {
         LOGGER.trace(String.format("Getting last updated time for %s", targetPath));
         return artifactory
                 .repository(this.config.repository)
-                .file(targetPath)
+                .file(Utils.urlEncodeParts(targetPath))
                 .info()
                 .getLastModified()
                 .getTime();
