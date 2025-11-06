@@ -119,21 +119,39 @@ class ArtifactoryClient implements AutoCloseable {
         try {
             // Use Storage API to get folder info with immediate children only
             // This is much more efficient than FileSpec/AQL searches which fetch all nested files
-            Folder folder = artifactory.repository(this.config.repository)
-                    .folder(Utils.urlEncodeParts(targetPath));
+            ItemHandle folderHandle =
+                    artifactory.repository(this.config.repository).folder(Utils.urlEncodeParts(targetPath));
+            Folder folder = folderHandle.info();
 
-            return folder.list().stream()
+            return folder.getChildren().stream()
                     .map(item -> {
                         // Construct full path for the child item
                         String childPath = targetPath.endsWith("/")
-                                ? targetPath + item.getUri().substring(1)  // Remove leading "/" from URI
+                                ? targetPath + item.getUri().substring(1) // Remove leading "/" from URI
                                 : targetPath + item.getUri();
 
+                        // Get file size - children from getChildren() don't include size, need to fetch it
+                        long size = 0;
+                        if (!item.isFolder()) {
+                            try {
+                                // Make an additional API call to get file info with size
+                                File fileInfo = artifactory
+                                        .repository(this.config.repository)
+                                        .file(Utils.urlEncodeParts(childPath))
+                                        .info();
+                                size = fileInfo.getSize();
+                            } catch (Exception e) {
+                                LOGGER.debug(String.format("Failed to get size for %s", childPath), e);
+                            }
+                        }
+
+                        // Get last modified time, defaulting to 0 if null
+                        long lastModified = item.getLastModified() != null
+                                ? item.getLastModified().getTime()
+                                : 0;
+
                         return new FileInfo(
-                                childPath,
-                                item.getLastModified().getTime(),
-                                item.getSize(),
-                                item.isFolder() ? AqlItemType.FOLDER : AqlItemType.FILE);
+                                childPath, lastModified, size, item.isFolder() ? AqlItemType.FOLDER : AqlItemType.FILE);
                     })
                     .collect(Collectors.toList());
         } catch (Exception e) {
