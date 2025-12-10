@@ -9,7 +9,6 @@ import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
-import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 import jenkins.util.VirtualFile;
@@ -27,8 +26,7 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
     private final transient Run<?, ?> build;
     private final ArtifactoryClient.FileInfo fileInfo;
 
-    // Transient cached client - reused across operations to avoid creating/destroying connections
-    // Similar to how S3 plugin caches BlobStoreContext
+    // Cached client - reused across operations to avoid creating/destroying connections
     private transient ArtifactoryClient cachedClient;
 
     public ArtifactoryVirtualFile(String key, Run<?, ?> build) {
@@ -188,6 +186,10 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         }
     }
 
+    /**
+     * Lazily creates and caches an ArtifactoryClient
+     * @return a cached ArtifactoryClient instance
+     */
     private ArtifactoryClient buildArtifactoryClient() {
         if (cachedClient == null) {
             ArtifactoryGenericArtifactConfig config = Utils.getArtifactConfig();
@@ -212,7 +214,7 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
                     .collect(Collectors.toList());
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to list files from prefix %s", prefix), e);
-            return Collections.emptyList();
+            return List.of();
         }
     }
 }

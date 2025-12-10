@@ -73,7 +73,7 @@ class ArtifactoryClient implements AutoCloseable {
      */
     public void copy(String sourcePath, String targetPath) {
         ItemHandle sourceItem = artifactory.repository(this.config.repository).folder(Utils.urlEncodeParts(sourcePath));
-        sourceItem.copy(this.config.repository, targetPath);
+        sourceItem.copy(this.config.repository, Utils.urlEncodeParts(targetPath));
     }
 
     /**
@@ -104,8 +104,8 @@ class ArtifactoryClient implements AutoCloseable {
     }
 
     /**
-     * List the immediate children in a folder (non-recursive)
-     * Uses Artifactory Storage API which is more efficient than AQL searches
+     * List the files in a folder
+     * Uses Artifactory Storage API
      * @param targetPath the path to list
      * @return the list of immediate children in the folder
      * @throws IOException if the files cannot be listed
