@@ -177,9 +177,8 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
         if (!isFile()) {
             throw new FileNotFoundException("Cannot open it because it is not a file.");
         }
-        ArtifactoryClient client = buildArtifactoryClient();
         try {
-            return client.downloadArtifact(this.key);
+            return buildArtifactoryClient().downloadArtifact(this.key);
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to open %s", this.key), e);
             throw new IOException(e);
