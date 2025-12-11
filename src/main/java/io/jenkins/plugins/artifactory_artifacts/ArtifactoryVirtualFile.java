@@ -199,14 +199,12 @@ public class ArtifactoryVirtualFile extends ArtifactoryAbstractVirtualFile {
     }
 
     /**
-     * List the immediate children from a prefix
-     * @param prefix the prefix (folder path)
-     * @return the list of immediate children (files and folders)
+     * List the files from a prefix
+     * @param prefix the prefix
+     * @return the list of files and folders from the prefix
      */
     private List<VirtualFile> listFilesFromPrefix(String prefix) {
         try {
-            // client.list() now returns only immediate children, not all nested files
-            // This eliminates the need for complex path parsing and deduplication
             List<ArtifactoryClient.FileInfo> children = buildArtifactoryClient().list(prefix);
 
             return children.stream()

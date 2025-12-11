@@ -107,7 +107,7 @@ class ArtifactoryClient implements AutoCloseable {
      * List the files in a folder
      * Uses Artifactory Storage API
      * @param targetPath the path to list
-     * @return the list of immediate children in the folder
+     * @return the list of files in the folder
      * @throws IOException if the files cannot be listed
      */
     public List<FileInfo> list(String targetPath) throws IOException {
@@ -117,45 +117,30 @@ class ArtifactoryClient implements AutoCloseable {
         }
 
         try {
-            // Use Storage API to get folder info with immediate children only
-            // This is much more efficient than FileSpec/AQL searches which fetch all nested files
             ItemHandle folderHandle =
                     artifactory.repository(this.config.repository).folder(Utils.urlEncodeParts(targetPath));
             Folder folder = folderHandle.info();
-
             List<Item> children = folder.getChildren();
-            LOGGER.debug(String.format("Found %d children in %s", children.size(), targetPath));
-
             return children.stream()
                     .map(item -> {
                         try {
-                            // Construct full path for the child item
                             String childPath = targetPath.endsWith("/")
-                                    ? targetPath + item.getUri().substring(1) // Remove leading "/" from URI
+                                    ? targetPath + item.getUri().substring(1)
                                     : targetPath + item.getUri();
 
-                            LOGGER.debug(String.format("Processing child: %s (folder=%s)", childPath, item.isFolder()));
-
-                            // Get file size - children from getChildren() don't include size, need to fetch it
                             long size = 0;
-                            if (!item.isFolder()) {
-                                try {
-                                    // Make an additional API call to get file info with size
-                                    File fileInfo = artifactory
-                                            .repository(this.config.repository)
-                                            .file(Utils.urlEncodeParts(childPath))
-                                            .info();
-                                    size = fileInfo.getSize();
-                                    LOGGER.debug(String.format("File %s size: %d bytes", childPath, size));
-                                } catch (Exception e) {
-                                    LOGGER.warn(String.format("Failed to get size for %s", childPath), e);
-                                }
+                            try {
+                                size = size(childPath);
+                            } catch (Exception e) {
+                                LOGGER.warn(String.format("Failed to get size of %s", childPath), e);
                             }
 
-                            // Get last modified time, defaulting to 0 if null
-                            long lastModified = item.getLastModified() != null
-                                    ? item.getLastModified().getTime()
-                                    : 0;
+                            long lastModified = 0;
+                            try {
+                                lastModified = lastUpdated(childPath);
+                            } catch (Exception e) {
+                                LOGGER.warn(String.format("Failed to get last updated time of %s", childPath), e);
+                            }
 
                             return new FileInfo(
                                     childPath,
@@ -164,10 +149,10 @@ class ArtifactoryClient implements AutoCloseable {
                                     item.isFolder() ? AqlItemType.FOLDER : AqlItemType.FILE);
                         } catch (Exception e) {
                             LOGGER.error(String.format("Error processing item in %s", targetPath), e);
-                            return null; // Return null for failed items
+                            return null;
                         }
                     })
-                    .filter(fileInfo -> fileInfo != null) // Filter out failed items
+                    .filter(fileInfo -> fileInfo != null)
                     .collect(Collectors.toList());
         } catch (Exception e) {
             LOGGER.warn(String.format("Failed to list folder contents for %s", targetPath), e);
